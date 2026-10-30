@@ -1,0 +1,16 @@
+# Python environments and caches
+.venv/
+.venv-*/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Repository data and local databases
+repositories/
+*.sqlite3
+*.db
+
+# Local environment secrets
+.env
+.env.*
+!.env.example
