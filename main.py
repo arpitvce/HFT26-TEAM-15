@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from repository_ingestion import IngestionError, ingest_zip_archive, register_local_repository
 from repository_scanner import (
@@ -31,6 +31,7 @@ from repository_parse_service import (
     parse_registered_repository,
 )
 from repository_store import RepositoryStore
+from search_service import SearchUnavailableError, search_repository
 
 logger = logging.getLogger(__name__)
 app = FastAPI(title="GitHub Repository Explorer API", version="2.2.0")
@@ -223,6 +224,50 @@ class ImportsResponse(BaseModel):
     total: int
     has_more: bool
     imports: list[RepositoryImportResponse]
+
+
+class SearchRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    query: str = Field(..., min_length=1, max_length=2000)
+    limit: int = Field(10, ge=1, le=100)
+    language: str | None = Field(None, min_length=1, max_length=50)
+    file_path: str | None = Field(None, min_length=1, max_length=4096)
+    path_prefix: str | None = Field(None, min_length=1, max_length=4096)
+    symbol_type: Literal["class", "function", "method"] | None = None
+    retrieval_method: Literal["hybrid", "lexical", "semantic", "symbol"] = "hybrid"
+
+    @model_validator(mode="after")
+    def validate_path_filter(self) -> SearchRequest:
+        if self.file_path is not None and self.path_prefix is not None:
+            raise ValueError("file_path and path_prefix cannot be used together")
+        return self
+
+
+class SearchResultResponse(BaseModel):
+    repository_id: str
+    file_path: str
+    symbol_name: str | None
+    symbol_type: Literal["class", "function", "method"] | None
+    language: str
+    snippet: str
+    start_line: int
+    end_line: int
+    bm25_score: float | None
+    semantic_score: float | None
+    symbol_score: float
+    final_score: float
+    retrieval_methods: list[Literal["lexical", "semantic", "symbol"]]
+
+
+class SearchResponse(BaseModel):
+    repository_id: str
+    query: str
+    retrieval_method: Literal["hybrid", "lexical", "semantic", "symbol"]
+    semantic_available: bool
+    available_methods: list[Literal["lexical", "semantic", "symbol"]]
+    effective_weights: dict[str, float]
+    results: list[SearchResultResponse]
 
 
 def get_store() -> RepositoryStore:
@@ -489,6 +534,28 @@ def repository_imports(
         "has_more": offset + len(imports) < total,
         "imports": imports,
     }
+
+
+@app.post("/repositories/{repository_id}/search", response_model=SearchResponse)
+def search_repository_endpoint(repository_id: str, request: SearchRequest) -> dict[str, Any]:
+    store = get_store()
+    _repository_for_current_parse(repository_id, store)
+    normalized_file_path = _normalize_relative_path(request.file_path) if request.file_path else None
+    normalized_path_prefix = _normalize_relative_path(request.path_prefix) if request.path_prefix else None
+    try:
+        return search_repository(
+            repository_id,
+            request.query,
+            request.limit,
+            store,
+            request.retrieval_method,
+            request.language,
+            normalized_file_path,
+            normalized_path_prefix,
+            request.symbol_type,
+        )
+    except SearchUnavailableError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
 
 @app.get("/repositories/{repository_id}/parsing-summary", response_model=ParsingSummaryResponse)

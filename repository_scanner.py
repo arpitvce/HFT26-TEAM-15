@@ -118,6 +118,15 @@ def is_binary_file(path: Path, extension: str, size_bytes: int) -> bool:
     finally:
         if descriptor is not None:
             os.close(descriptor)
+    return is_binary_content(sample, extension, size_bytes)
+
+
+def is_binary_content(sample: bytes, extension: str, size_bytes: int) -> bool:
+    """Apply the scanner's bounded binary heuristic to already-read bytes."""
+    if extension.casefold() in BINARY_EXTENSIONS:
+        return True
+    if size_bytes > MAX_FILE_SIZE_BYTES:
+        return False
     if b"\x00" in sample:
         return True
     try:
@@ -126,6 +135,30 @@ def is_binary_file(path: Path, extension: str, size_bytes: int) -> bool:
         return True
     control_bytes = sum(byte < 32 and byte not in {9, 10, 12, 13} for byte in sample)
     return bool(sample) and control_bytes / len(sample) > 0.10
+
+
+def current_file_exclusion_reason(relative_path: str, content: bytes) -> str | None:
+    """Recheck inclusion policy for a safely read indexed file without scanning the repo."""
+    path = PurePosixPath(relative_path)
+    parts = path.parts
+    for directory in parts[:-1]:
+        if directory.casefold() in EXCLUDED_DIRECTORY_NAMES:
+            return f"excluded_directory:{directory}"
+    extension = Path(parts[-1]).suffix.casefold() if parts else ""
+    if any(
+        fnmatch.fnmatchcase(relative_path.casefold(), pattern)
+        or fnmatch.fnmatchcase(parts[-1].casefold(), pattern)
+        for pattern in GENERATED_FILE_PATTERNS
+    ):
+        return "generated_file"
+    if len(content) > MAX_FILE_SIZE_BYTES:
+        return f"file_exceeds_{MAX_FILE_SIZE_BYTES}_byte_limit"
+    binary = is_binary_content(content[:BINARY_SNIFF_BYTES], extension, len(content))
+    if binary:
+        return "binary_file"
+    if detect_language(extension) == "unknown":
+        return "unsupported_file_type"
+    return None
 
 
 def _is_junction(path: Path) -> bool:

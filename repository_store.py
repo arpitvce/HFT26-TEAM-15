@@ -81,6 +81,61 @@ class RepositoryStore:
                     parsed_at TEXT NOT NULL,
                     PRIMARY KEY(repository_id, file_path)
                 );
+                CREATE TABLE IF NOT EXISTS search_index_files (
+                    repository_id TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    document_count INTEGER NOT NULL DEFAULT 0,
+                    embedding_provider TEXT,
+                    embedding_model TEXT,
+                    embedding_count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(repository_id, file_path),
+                    FOREIGN KEY(repository_id, file_path)
+                        REFERENCES parsed_files(repository_id, file_path) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS search_documents (
+                    document_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    repository_id TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    language TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    symbol_name TEXT,
+                    symbol_type TEXT,
+                    symbol_names TEXT NOT NULL,
+                    UNIQUE(repository_id, file_path, chunk_index),
+                    CHECK(start_line >= 1 AND end_line >= start_line),
+                    FOREIGN KEY(repository_id, file_path)
+                        REFERENCES search_index_files(repository_id, file_path) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_search_documents_repository
+                    ON search_documents(repository_id, file_path, start_line, end_line);
+                CREATE VIRTUAL TABLE IF NOT EXISTS search_documents_fts USING fts5(
+                    file_path, symbol_names, language, content,
+                    content='search_documents', content_rowid='document_id', tokenize='unicode61'
+                );
+                CREATE TRIGGER IF NOT EXISTS search_documents_fts_insert
+                AFTER INSERT ON search_documents BEGIN
+                    INSERT INTO search_documents_fts(rowid, file_path, symbol_names, language, content)
+                    VALUES (new.document_id, new.file_path, new.symbol_names, new.language, new.content);
+                END;
+                CREATE TRIGGER IF NOT EXISTS search_documents_fts_delete
+                AFTER DELETE ON search_documents BEGIN
+                    INSERT INTO search_documents_fts(search_documents_fts, rowid, file_path, symbol_names, language, content)
+                    VALUES ('delete', old.document_id, old.file_path, old.symbol_names, old.language, old.content);
+                END;
+                CREATE TABLE IF NOT EXISTS search_embeddings (
+                    document_id INTEGER PRIMARY KEY REFERENCES search_documents(document_id) ON DELETE CASCADE,
+                    repository_id TEXT NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+                    provider_id TEXT NOT NULL,
+                    model_id TEXT NOT NULL,
+                    vector_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_search_embeddings_repository
+                    ON search_embeddings(repository_id, provider_id, model_id);
                 CREATE TABLE IF NOT EXISTS repository_symbols (
                     symbol_id TEXT PRIMARY KEY,
                     repository_id TEXT NOT NULL,
@@ -410,6 +465,10 @@ class RepositoryStore:
         symbols: list[dict[str, Any]],
         imports: list[dict[str, Any]],
         error: dict[str, Any] | None = None,
+        search_documents: list[dict[str, Any]] | None = None,
+        embeddings: list[list[float]] | None = None,
+        embedding_provider: str | None = None,
+        embedding_model: str | None = None,
     ) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -478,6 +537,279 @@ class RepositoryStore:
                         error.get("start_line"), parsed_at,
                     ),
                 )
+            if search_documents is not None:
+                self._write_search_index(
+                    connection, repository_id, file_path, content_hash or "",
+                    search_documents, embeddings or [], embedding_provider, embedding_model,
+                )
+
+    @staticmethod
+    def _write_search_index(
+        connection: sqlite3.Connection,
+        repository_id: str,
+        file_path: str,
+        content_hash: str,
+        documents: list[dict[str, Any]],
+        embeddings: list[list[float]],
+        embedding_provider: str | None,
+        embedding_model: str | None,
+    ) -> None:
+        if embeddings and (len(embeddings) != len(documents) or not embedding_provider or not embedding_model):
+            raise ValueError("Search embeddings must correspond to indexed documents and a provider/model")
+        connection.execute(
+            "DELETE FROM search_documents WHERE repository_id=? AND file_path=?",
+            (repository_id, file_path),
+        )
+        connection.execute(
+            "DELETE FROM search_index_files WHERE repository_id=? AND file_path=?",
+            (repository_id, file_path),
+        )
+        connection.execute(
+            """INSERT INTO search_index_files(
+                repository_id, file_path, content_hash, document_count,
+                embedding_provider, embedding_model, embedding_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                repository_id, file_path, content_hash, len(documents),
+                embedding_provider if embeddings else None,
+                embedding_model if embeddings else None, len(embeddings),
+            ),
+        )
+        rows: list[tuple[Any, ...]] = []
+        for document in documents:
+            if document["file_path"] != file_path or document["content_hash"] != content_hash:
+                raise ValueError("Search document metadata does not match its indexed file")
+            if document["start_line"] < 1 or document["end_line"] < document["start_line"]:
+                raise ValueError("Search document line range is invalid")
+            rows.append((
+                repository_id, file_path, document["chunk_index"], content_hash,
+                document["language"], document["start_line"], document["end_line"],
+                document["content"], document.get("symbol_name"), document.get("symbol_type"),
+                document.get("symbol_names", ""),
+            ))
+        connection.executemany(
+            """INSERT INTO search_documents(
+                repository_id, file_path, chunk_index, content_hash, language,
+                start_line, end_line, content, symbol_name, symbol_type, symbol_names
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        if embeddings:
+            document_ids = connection.execute(
+                "SELECT document_id FROM search_documents WHERE repository_id=? AND file_path=? "
+                "ORDER BY chunk_index",
+                (repository_id, file_path),
+            ).fetchall()
+            connection.executemany(
+                """INSERT INTO search_embeddings(
+                    document_id, repository_id, provider_id, model_id, vector_json
+                ) VALUES (?, ?, ?, ?, ?)""",
+                [
+                    (row[0], repository_id, embedding_provider, embedding_model, json.dumps(vector))
+                    for row, vector in zip(document_ids, embeddings, strict=True)
+                ],
+            )
+
+    def save_search_index_for_cached_file(
+        self,
+        repository_id: str,
+        file_path: str,
+        content_hash: str,
+        documents: list[dict[str, Any]],
+        embeddings: list[list[float]],
+        embedding_provider: str | None,
+        embedding_model: str | None,
+    ) -> None:
+        with self._connect() as connection:
+            self._write_search_index(
+                connection, repository_id, file_path, content_hash, documents,
+                embeddings, embedding_provider, embedding_model,
+            )
+
+    def search_index_is_current(
+        self,
+        repository_id: str,
+        file_path: str,
+        content_hash: str,
+        embedding_provider: str | None,
+        embedding_model: str | None,
+    ) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT state.content_hash, state.document_count, state.embedding_provider,
+                          state.embedding_model, state.embedding_count,
+                          (SELECT COUNT(*) FROM search_documents AS documents
+                           WHERE documents.repository_id=state.repository_id
+                             AND documents.file_path=state.file_path) AS actual_documents,
+                          (SELECT COUNT(*) FROM search_embeddings AS embeddings
+                           JOIN search_documents AS documents USING(document_id)
+                           WHERE documents.repository_id=state.repository_id
+                             AND documents.file_path=state.file_path
+                             AND embeddings.repository_id=state.repository_id
+                             AND embeddings.provider_id=state.embedding_provider
+                             AND embeddings.model_id=state.embedding_model) AS actual_embeddings
+                   FROM search_index_files AS state
+                   WHERE state.repository_id=? AND state.file_path=?""",
+                (repository_id, file_path),
+            ).fetchone()
+        if row is None:
+            return False
+        return (
+            row["content_hash"] == content_hash
+            and row["document_count"] == row["actual_documents"]
+            and row["embedding_count"] == row["actual_embeddings"]
+            and row["embedding_provider"] == (embedding_provider if row["embedding_count"] else None)
+            and row["embedding_model"] == (embedding_model if row["embedding_count"] else None)
+            and (not embedding_provider or row["embedding_count"] == row["document_count"])
+        )
+
+    def get_symbols_for_file(self, repository_id: str, file_path: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM repository_symbols WHERE repository_id=? AND file_path=? "
+                "ORDER BY start_line, end_line, symbol_name",
+                (repository_id, file_path),
+            ).fetchall()
+        return [self._decode_symbol(row) for row in rows]
+
+    @staticmethod
+    def _search_filter_sql(
+        repository_id: str,
+        language: str | None,
+        file_path: str | None,
+        path_prefix: str | None,
+        symbol_type: str | None,
+    ) -> tuple[list[str], list[Any]]:
+        clauses = [
+            "documents.repository_id=?",
+            "files.entry_type='file'",
+            "files.is_included=1",
+            "parsed.status IN ('complete', 'partial', 'skipped')",
+            "parses.status='complete'",
+            "parses.scan_timestamp=scans.scanned_at",
+            "scans.status='complete'",
+            "parsed.content_hash=documents.content_hash",
+            "index_files.content_hash=documents.content_hash",
+        ]
+        params: list[Any] = [repository_id]
+        if language:
+            clauses.append("documents.language=?")
+            params.append(language)
+        if file_path:
+            clauses.append("documents.file_path=?")
+            params.append(file_path)
+        if path_prefix:
+            prefix = path_prefix + "/"
+            clauses.append("(documents.file_path=? OR substr(documents.file_path, 1, ?) = ?)")
+            params.extend((path_prefix, len(prefix), prefix))
+        if symbol_type:
+            clauses.append("documents.symbol_type=?")
+            params.append(symbol_type)
+        return clauses, params
+
+    @staticmethod
+    def _search_from_sql() -> str:
+        return """FROM search_documents AS documents
+            JOIN search_index_files AS index_files
+              ON index_files.repository_id=documents.repository_id AND index_files.file_path=documents.file_path
+            JOIN repository_files AS files
+              ON files.repository_id=documents.repository_id AND files.relative_path=documents.file_path
+            JOIN parsed_files AS parsed
+              ON parsed.repository_id=documents.repository_id AND parsed.file_path=documents.file_path
+            JOIN repository_parses AS parses ON parses.repository_id=documents.repository_id
+            JOIN repository_scans AS scans ON scans.repository_id=documents.repository_id"""
+
+    def search_lexical_documents(
+        self,
+        repository_id: str,
+        fts_query: str,
+        limit: int,
+        language: str | None = None,
+        file_path: str | None = None,
+        path_prefix: str | None = None,
+        symbol_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses, params = self._search_filter_sql(repository_id, language, file_path, path_prefix, symbol_type)
+        where = " AND ".join(["search_documents_fts MATCH ?", *clauses])
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT documents.*, bm25(search_documents_fts, 2.0, 4.0, 0.5, 1.0) AS bm25_raw
+                   """ + self._search_from_sql() +
+                " JOIN search_documents_fts ON search_documents_fts.rowid=documents.document_id "
+                f"WHERE {where} ORDER BY bm25_raw LIMIT ?",
+                [fts_query, *params, limit],
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def search_symbol_documents(
+        self,
+        repository_id: str,
+        terms: list[str],
+        limit: int,
+        language: str | None = None,
+        file_path: str | None = None,
+        path_prefix: str | None = None,
+        symbol_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses, params = self._search_filter_sql(repository_id, language, file_path, path_prefix, symbol_type)
+        escaped = [term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") for term in terms]
+        clauses.append("(" + " OR ".join("documents.symbol_names LIKE ? ESCAPE '\\'" for _ in escaped) + ")")
+        params.extend(f"%{term}%" for term in escaped)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT documents.* " + self._search_from_sql() +
+                " WHERE " + " AND ".join(clauses) +
+                " ORDER BY documents.file_path, documents.start_line LIMIT ?",
+                [*params, limit],
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def semantic_index_is_ready(
+        self,
+        repository_id: str,
+        provider_id: str,
+        model_id: str,
+        language: str | None = None,
+        file_path: str | None = None,
+        path_prefix: str | None = None,
+        symbol_type: str | None = None,
+    ) -> bool:
+        clauses, params = self._search_filter_sql(repository_id, language, file_path, path_prefix, symbol_type)
+        where = " AND ".join(clauses)
+        with self._connect() as connection:
+            counts = connection.execute(
+                """SELECT COUNT(*) AS documents,
+                          SUM(CASE WHEN embeddings.document_id IS NOT NULL
+                                    AND embeddings.provider_id=? AND embeddings.model_id=? THEN 1 ELSE 0 END) AS embeddings
+                   """ + self._search_from_sql() +
+                   " LEFT JOIN search_embeddings AS embeddings ON embeddings.document_id=documents.document_id "
+                f"WHERE {where}",
+                [provider_id, model_id, *params],
+            ).fetchone()
+        return counts["documents"] > 0 and counts["documents"] == (counts["embeddings"] or 0)
+
+    def iter_semantic_documents(
+        self,
+        repository_id: str,
+        provider_id: str,
+        model_id: str,
+        language: str | None = None,
+        file_path: str | None = None,
+        path_prefix: str | None = None,
+        symbol_type: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        clauses, params = self._search_filter_sql(repository_id, language, file_path, path_prefix, symbol_type)
+        clauses.extend(("embeddings.provider_id=?", "embeddings.model_id=?"))
+        params.extend((provider_id, model_id))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT documents.*, embeddings.vector_json " + self._search_from_sql() +
+                " JOIN search_embeddings AS embeddings ON embeddings.document_id=documents.document_id "
+                " WHERE " + " AND ".join(clauses),
+                params,
+            )
+            for row in rows:
+                yield dict(row)
 
     def complete_parse(
         self,

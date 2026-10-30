@@ -160,6 +160,61 @@ Symbol locations use one-based line and character-column values. `end_line` is i
 
 Parsing uses individually pinned Tree-sitter grammar wheels (listed in `requirements.txt`) with `tree-sitter==0.26.0`. Parser limits default to the Phase 2 per-file size limit (1 MiB), 10,000 eligible files, and 250 MiB of source per parse run. Configure them with `REPOSITORY_MAX_PARSE_FILE_BYTES`, `REPOSITORY_MAX_PARSE_FILES`, and `REPOSITORY_MAX_PARSE_TOTAL_BYTES`. Binary and Phase 2-excluded files are not read by the parser. Symbol and import results are only served when they correspond to the latest completed scan; rescan, then parse, after repository changes.
 
+## Hybrid search API
+
+Search requires a completed scan and parse. `POST /repositories/{repository_id}/search` accepts:
+
+```json
+{
+  "query": "Where is password verification implemented?",
+  "limit": 10,
+  "language": "Python",
+  "path_prefix": "src",
+  "symbol_type": "function",
+  "retrieval_method": "hybrid"
+}
+```
+
+Filters are optional. `file_path` selects one exact repository-relative path; `path_prefix` selects a directory subtree, and those two fields cannot be combined. `symbol_type` accepts `class`, `function`, or `method`. `retrieval_method` accepts `hybrid`, `lexical`, `symbol`, or `semantic`.
+
+Example response:
+
+```json
+{
+  "repository_id": "repo_example",
+  "query": "Where is password verification implemented?",
+  "retrieval_method": "hybrid",
+  "semantic_available": false,
+  "available_methods": ["lexical", "symbol"],
+  "effective_weights": {"lexical": 0.6667, "symbol": 0.3333},
+  "results": [
+    {
+      "repository_id": "repo_example",
+      "file_path": "src/auth.py",
+      "symbol_name": "verify_password",
+      "symbol_type": "function",
+      "language": "Python",
+      "snippet": "def verify_password(password, candidate):\n    return password == candidate\n",
+      "start_line": 1,
+      "end_line": 2,
+      "bm25_score": 1.0,
+      "semantic_score": null,
+      "symbol_score": 1.0,
+      "final_score": 1.0,
+      "retrieval_methods": ["lexical", "symbol"]
+    }
+  ]
+}
+```
+
+Source chunks are created during parsing, partition source without overlapping line ranges, and preserve exact one-based inclusive locations. Lexical search uses SQLite FTS5 BM25 over source text, symbol names, language, and path. Symbol relevance comes from the Phase 3 parser index. Hybrid search normalizes each available signal to `[0, 1]`, applies initial weights `0.4K + 0.4S + 0.2Y`, then renormalizes the weights across methods available for that request. If semantic search is unavailable, the effective weights become `2/3` lexical and `1/3` symbol. The response returns those effective weights and individual scores.
+
+### Optional semantic search
+
+The default setup has no embedding provider; lexical and symbol retrieval work without credentials. To enable semantics, set `SEARCH_EMBEDDING_ENDPOINT` and `SEARCH_EMBEDDING_MODEL`, plus `SEARCH_EMBEDDING_API_KEY` if required. The HTTP adapter expects an OpenAI-compatible embeddings endpoint. It uses only the explicitly configured URL and does not assume Featherless provides embeddings. These settings can be placed in root `.env.secret` (ignored by Git). Tests inject a mock provider and make no external calls.
+
+After enabling/changing a provider, call the parse endpoint to create or refresh vectors. Before returning results, search safely rereads each distinct candidate file and compares its SHA-256 with the indexed hash. If a candidate changed, was deleted, became excluded, or cannot be safely validated, the entire request returns `409` and instructs the caller to force a scan followed by parsing. New files are not searchable until that explicit refresh. Candidate validation does not execute repository code and does not hash every repository file.
+
 Metadata includes relative paths, sizes, extensions, detected languages, UTC modification timestamps, hidden-file flags, inclusion status, binary/generated/unsupported/oversized flags, and exclusion reasons. The tree includes excluded entries so the UI can explain their status; excluded content is not removed from disk.
 
 ## Filtering and limits
@@ -182,4 +237,4 @@ Run tests with:
 python -m pytest -q
 ```
 
-Tests cover the Phase 3 grammar extractors, exact locations, imports, malformed and empty files, hash caching, changed files, skip/error recording, path safety, API filters, and Phase 1/2 regressions.
+Tests cover the Phase 3 grammar extractors, exact locations, imports, malformed and empty files, hash caching, changed files, skip/error recording, path safety, API filters, and Phase 1/2 regressions. Phase 4 tests cover BM25, symbol and mocked semantic retrieval, hybrid score normalization, repository isolation, filters, duplicate removal, chunk line accuracy, cached index refresh, candidate hash freshness (including direct modifications/deletions), fail-closed validation, and candidate-only validation cost.
