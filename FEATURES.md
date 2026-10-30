@@ -47,13 +47,21 @@ Status labels use the exact categories required by `AGENTS.md`. Verification ref
 |---|---|---|
 | GitHub URL validation | IMPLEMENTED AND VERIFIED | `POST /github` validates and normalizes HTTPS GitHub repository URLs. |
 | GitHub clone | IMPLEMENTED, NOT FULLY VERIFIED | Uses Git CLI with argument list and timeout; no live network clone was part of Phase 2 verification. |
-| Phase 4 search and retrieval | IMPLEMENTED AND VERIFIED | Repository-scoped BM25 lexical search, symbol relevance, optional embeddings, and normalized hybrid ranking are available through `POST /repositories/{id}/search`; all 83 tests pass. |
-| Phase 5 AI explanation | PLANNED | Featherless and evidence-grounded explanation are absent. |
+| Phase 4 search and retrieval | IMPLEMENTED AND VERIFIED | Repository-scoped BM25 lexical search, symbol relevance, optional embeddings, and normalized hybrid ranking are available through `POST /repositories/{id}/search`. |
+| Phase 5 AI explanation | IMPLEMENTED AND VERIFIED | `POST /repositories/{id}/ask` grounds explanations in bounded Phase 4 search evidence; evidence is returned separately. |
 | Phase 6 frontend/dashboard | PLANNED | No frontend exists. |
 | Phase 7 evaluation/integration | PLANNED | No retrieval benchmark or full-system evaluation exists. |
 | Phase 8 agentic investigation | PLANNED | No orchestrator, tool loop, evidence verification, or investigation history exists. |
 
-Phase 3 is implemented and verified. Phase 4 is implemented and its targeted and regression tests are reported with the delivery. Phases 5–8 remain planned.
+Phase 3 is implemented and verified. Phase 4 is implemented and verified. Phase 5 provides a bounded explanation request, not an autonomous agent. Phases 6–8 remain planned.
+
+## Phase 5 — AI Explanation Engine
+
+`POST /repositories/{repository_id}/ask` runs through one bounded `ExplanationService`: it retrieves repository-scoped Phase 4 evidence, requests up to eight structured claims from Featherless, and asks the separately configured Moonshot verifier to assess every claim as `supported`, `contradicted`, `not_established`, or `ambiguous`. At most five excerpts are sent, each capped at 4,000 characters and with a 20,000-character serialized context budget. Malformed, duplicate, missing, or unknown IDs fail safely. The response includes all assessments; only `model_assessed_supported` claims appear as facts, and other statuses are explicitly caveated. Model-based verification is fallible and cannot guarantee factual correctness.
+
+Set `FEATHERLESS_API_KEY`/`FEATHERLESS_MODEL` and `MOONSHOT_API_KEY`/`MOONSHOT_MODEL` on the backend; both provider roles are needed when claims are produced. The generator may make one validated `search_repository` tool call; the verifier receives no tools. This is one orchestrator and two model calls, not autonomous agents or an agent loop. `AIUsageTracker` writes per-call token/status/duration metadata to additive SQLite `ai_usage`; it never stores prompts, excerpts, or credentials. Costs are null unless operator-supplied per-million rates and provider-reported usage are both available. Tracking failures do not fail successful explanations. Phase 4 lexical and symbol search do not depend on either provider.
+
+`FEATHERLESS_TIMEOUT_SECONDS` and `MOONSHOT_TIMEOUT_SECONDS` configure independent provider request timeouts (default 45 seconds; each must be greater than 0 and at most 600 seconds).
 
 ## Phase 4 — Hybrid Search and Retrieval
 

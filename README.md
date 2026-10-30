@@ -217,6 +217,94 @@ After enabling/changing a provider, call the parse endpoint to create or refresh
 
 Metadata includes relative paths, sizes, extensions, detected languages, UTC modification timestamps, hidden-file flags, inclusion status, binary/generated/unsupported/oversized flags, and exclusion reasons. The tree includes excluded entries so the UI can explain their status; excluded content is not removed from disk.
 
+## AI explanation API
+
+`POST /repositories/{repository_id}/ask` retrieves relevant Phase 4 chunks and returns an assessed explanation separately from its trusted source evidence. It requires the repository to be scanned and parsed. Configure backend-only `FEATHERLESS_API_KEY`/`FEATHERLESS_MODEL` and `MOONSHOT_API_KEY`/`MOONSHOT_MODEL`; both roles are required when claims are produced. This does not affect lexical or symbol search.
+
+Provider timeouts are independently configurable with `FEATHERLESS_TIMEOUT_SECONDS` and `MOONSHOT_TIMEOUT_SECONDS` (each defaults to 45 seconds and must be greater than 0 and at most 600 seconds).
+
+Example request:
+
+```json
+{
+  "question": "How is password verification performed?",
+  "limit": 8,
+  "retrieval_method": "hybrid",
+  "language": "Python",
+  "path_prefix": "src"
+}
+```
+
+Example response:
+
+```json
+{
+  "repository_id": "repo_example",
+  "question": "How is password verification performed?",
+  "answer": "The candidate password is compared with the stored value [src/auth.py:10-12].",
+  "insufficient_evidence": false,
+  "claims": [
+    {
+      "claim_id": "C1",
+      "text": "The candidate password is compared with the stored value.",
+      "evidence_ids": ["E1"],
+      "assessment_evidence_ids": ["E1"],
+      "verification": "model_assessed_supported"
+    }
+  ],
+  "model": "configured-model",
+  "generator_model": "configured-featherless-model",
+  "verifier_model": "configured-moonshot-model",
+  "request_id": "5a1237a0-91cd-4ac2-bc12-5b74f7ad1249",
+  "usage": [
+    {
+      "role": "answer_generator",
+      "provider": "featherless",
+      "model": "configured-featherless-model",
+      "input_tokens": 740,
+      "output_tokens": 118,
+      "total_tokens": 858,
+      "usage_available": true,
+      "cost": null,
+      "cost_kind": "unavailable",
+      "cost_available": false,
+      "pricing_basis": null,
+      "status": "succeeded"
+    },
+    {
+      "role": "evidence_verifier",
+      "provider": "moonshot",
+      "model": "configured-moonshot-model",
+      "input_tokens": 825,
+      "output_tokens": 64,
+      "total_tokens": 889,
+      "usage_available": true,
+      "cost": null,
+      "cost_kind": "unavailable",
+      "cost_available": false,
+      "pricing_basis": null,
+      "status": "succeeded"
+    }
+  ],
+  "evidence": [
+    {
+      "evidence_id": "E1",
+      "file_path": "src/auth.py",
+      "start_line": 10,
+      "end_line": 12,
+      "snippet": "def verify_password(password, candidate):\\n    return password == candidate\\n",
+      "symbol_name": "verify_password",
+      "symbol_type": "function",
+      "language": "Python",
+      "retrieval_methods": ["lexical", "symbol"],
+      "snippet_truncated": false
+    }
+  ]
+}
+```
+
+Only selected excerpts are sent to the providers (up to five, 4,000 characters each and 20,000 characters total context); the repository is never sent wholesale. Featherless generates structured claims; Moonshot independently assesses every claim as `supported`, `contradicted`, `not_established`, or `ambiguous`. Non-supported claims are explicitly labeled and not stated as facts. These model assessments can still be wrong and do not guarantee factual correctness. Trusted paths and line ranges remain in the separate retrieved-evidence list and are used for generated answer citations. Usage metadata is recorded separately for every provider call; costs remain unavailable unless operator-supplied per-million input/output rates are configured. Usage persistence failures do not fail otherwise successful explanations. No search hits produce an explicit insufficient-evidence response without a model call. The generator may request one validated repository search; Phase 5 does not run an autonomous tool loop or persist conversation history. See [Featherless chat completions](https://featherless.ai/docs/completions) and [Moonshot chat API](https://platform.moonshot.ai/docs/api/chat).
+
 ## Filtering and limits
 
 Default excluded directory names: `.git`, `node_modules`, `venv`, `.venv`, `__pycache__`, `dist`, `build`, `coverage`, `.next`, `.cache`.

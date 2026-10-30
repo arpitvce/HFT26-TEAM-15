@@ -2,7 +2,7 @@
 
 ## Current architecture
 
-Repository Explorer currently has a modular FastAPI backend, SQLite persistence for repository metadata and scan snapshots, Tree-sitter parsing with structural symbol/import indexes, and repository-scoped hybrid search. It has no frontend or agent components.
+Repository Explorer currently has a modular FastAPI backend, SQLite persistence for repository metadata and scan snapshots, Tree-sitter parsing with structural symbol/import indexes, repository-scoped hybrid search, and a bounded evidence-grounded explanation endpoint. It has no frontend or autonomous agent loop.
 
 ```mermaid
 flowchart LR
@@ -31,6 +31,12 @@ flowchart LR
     API --> Explorer[Tree / summary / paginated files / safe file read]
     API --> Retrieval[search_service.py: BM25 / symbol / optional semantic]
     Retrieval --> Store
+    API --> Explanation[ExplanationService: bounded orchestration]
+    Explanation --> Retrieval
+    Explanation --> Featherless[Featherless: answer generator]
+    Explanation --> Moonshot[Moonshot: evidence verifier]
+    Explanation --> Usage[AIUsageTracker]
+    Usage --> Store
 ```
 
 ## Project structure
@@ -44,6 +50,7 @@ flowchart LR
 - `repository_store.py`: SQLite schema and operations for repository/scan/file metadata and parser status, symbols, imports, and errors.
 - `search_index.py`: deterministic non-overlapping source chunks with exact inclusive line ranges and practical symbol boundaries.
 - `search_service.py`: repository-scoped retrieval, component normalization, deduplication, and weighted ranking.
+- `ai_explanation.py`: `ExplanationService` bounds evidence, coordinates Featherless claim generation, at most one validated retrieval-tool call, independent Moonshot verification, deterministic schema/reference validation, response construction, and best-effort `AIUsageTracker` records.
 - `embedding_provider.py`: optional provider protocol and explicitly configured OpenAI-compatible HTTP adapter; no provider is enabled by default.
 - `tests/`: Phase 1/2 regression tests, Phase 3 parser/API tests, and Phase 4 retrieval/index-consistency tests.
 - `requirements.txt`: Python dependencies.
@@ -95,6 +102,7 @@ Parent-child relationships use `repository_symbols.parent_symbol_id` (self-refer
 - `repository_symbols`: symbol ID, repository-relative file path, name/qualified name, type, language, parent symbol, one-based locations, parameters JSON, source snippet, truncation flag, and byte offsets. Foreign keys link to the repository and `parsed_files`; a self-reference links parent symbols.
 - `repository_imports`: source-level imported module/symbol/alias/type, path, language, snippet, and one-based source range. Foreign keys link to the repository and `parsed_files`.
 - `repository_parse_errors`: parse or file-read errors with relative path, language, reason, safe message, optional line, and timestamp. Foreign keys link to the repository and `parsed_files`.
+- `ai_usage`: additive metadata-only provider-call usage records keyed uniquely by `(request_id, call_number)`, including repository, role, provider/model, token counts and actual/unavailable usage, optional cost/pricing basis, duration, status, and timestamp. Prompts, excerpts, and credentials are never stored.
 - `search_index_files`: per-file search content hash, chunk count, provider/model identifiers, and embedding count. Child of `parsed_files`.
 - `search_documents`: source chunks with repository/path/language, exact inclusive range, snippet, and available symbol metadata. Child of `search_index_files`.
 - `search_documents_fts`: SQLite FTS5 external-content index over file path, symbol names, language, and source text; insert/delete triggers keep it synchronized.
@@ -115,6 +123,7 @@ There is no migration framework in the project. Tables and indexes are created w
 | `GET` | `/repositories/{repository_id}/symbols` | Paginated/filterable symbols (`name`, type, language, exact path). |
 | `GET` | `/repositories/{repository_id}/symbols/{symbol_id}` | Retrieve a symbol and its source evidence. |
 | `POST` | `/repositories/{repository_id}/search` | Search with `hybrid`, `lexical`, `symbol`, or optional `semantic` retrieval and language/path/type filters. |
+| `POST` | `/repositories/{repository_id}/ask` | Retrieve bounded search evidence and generate a cited explanation when Featherless is configured. |
 | `GET` | `/repositories/{repository_id}/imports` | Paginated/filterable source import records. |
 | `GET` | `/repositories/{repository_id}/parsing-summary` | Parse run status, counts, errors, and skipped reasons. |
 | `GET` | `/repositories/{repository_id}/tree` | Return the persisted hierarchical tree. |
@@ -140,6 +149,10 @@ There is no migration framework in the project. Tables and indexes are created w
 - `SEARCH_EMBEDDING_ENDPOINT`: optional explicit HTTP(S) embeddings endpoint; the included adapter expects an OpenAI-compatible request/response format.
 - `SEARCH_EMBEDDING_MODEL`: model identifier required with the endpoint.
 - `SEARCH_EMBEDDING_API_KEY`: optional bearer token; local values may live in the ignored root `.env.secret`.
+- `FEATHERLESS_API_KEY`, `FEATHERLESS_MODEL`: backend-only Answer Generator configuration.
+- `MOONSHOT_API_KEY`, `MOONSHOT_MODEL`: backend-only Evidence Verifier configuration. The model identifier is operator-configured; no identifier is assumed.
+- `FEATHERLESS_TIMEOUT_SECONDS`, `MOONSHOT_TIMEOUT_SECONDS`: independent provider request timeouts, each defaulting to 45 seconds and validated in the range `(0, 600]`.
+- `FEATHERLESS_INPUT_PRICE_PER_MILLION`, `FEATHERLESS_OUTPUT_PRICE_PER_MILLION`, `MOONSHOT_INPUT_PRICE_PER_MILLION`, `MOONSHOT_OUTPUT_PRICE_PER_MILLION`: optional operator-maintained prices. Costs are null unless both token rates for that provider and provider-reported token usage are available. `FEATHERLESS_PRICING_VERSION` and `MOONSHOT_PRICING_VERSION` label the configured pricing basis.
 
 ZIP upload/extraction configuration is documented in `README.md`.
 
@@ -156,4 +169,4 @@ ZIP upload/extraction configuration is documented in `README.md`.
 - Search candidate generation is capped at 500 rows per method. Semantic similarity currently scans stored vectors in Python; large vector collections may need a dedicated vector index.
 - Semantic retrieval sends indexed source text only to the explicitly configured endpoint. Lexical and symbol search need no external service or credentials.
 - Search validates only distinct files represented in its bounded retrieval candidates, not the entire repository. This detects stale candidate snippets without hashing every file on every request. A detected change or unverifiable file returns `409` and requires a forced scan followed by parsing. New files are not discovered or searchable until that explicit refresh. Validation is not an atomic filesystem snapshot; metadata checks detect common writes during reads, but concurrent filesystem mutation immediately after validation remains possible.
-- No AI explanation, agent loop, or frontend is implemented.
+- Phase 5 sends only selected bounded excerpts to two separate providers: Featherless generates structured claims and Moonshot independently assesses each claim. The service requires exactly one valid assessment per claim and labels each status `model_assessed_*`; only supported claims are stated as facts. Assessment is fallible and does not guarantee factual correctness. All returned locators/snippets are sourced from validated Phase 4 records. Tool-calling support varies by generator model; at most one validated retrieval call is supported, with no autonomous investigation loop or conversation history. Usage writes are best effort and do not invalidate a successful explanation.

@@ -196,6 +196,28 @@ class RepositoryStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_parse_errors_repository
                     ON repository_parse_errors(repository_id);
+                CREATE TABLE IF NOT EXISTS ai_usage (
+                    usage_id TEXT PRIMARY KEY,
+                    repository_id TEXT NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+                    request_id TEXT NOT NULL,
+                    call_number INTEGER NOT NULL CHECK(call_number >= 1),
+                    role TEXT NOT NULL CHECK(role IN ('answer_generator', 'evidence_verifier')),
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    total_tokens INTEGER,
+                    usage_kind TEXT NOT NULL CHECK(usage_kind IN ('actual', 'estimated', 'unavailable')),
+                    cost REAL,
+                    cost_kind TEXT NOT NULL CHECK(cost_kind IN ('estimated', 'unavailable')),
+                    pricing_basis TEXT,
+                    duration_ms INTEGER NOT NULL CHECK(duration_ms >= 0),
+                    status TEXT NOT NULL CHECK(status IN ('succeeded', 'failed')),
+                    created_at TEXT NOT NULL,
+                    UNIQUE(request_id, call_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_ai_usage_repository_created
+                    ON ai_usage(repository_id, created_at);
                 """
             )
 
@@ -231,6 +253,35 @@ class RepositoryStore:
                 "VALUES (?, ?, ?, ?, ?, 'processing')",
                 (repository_id, name, str(root_path), input_type, created_at),
             )
+
+    def record_ai_usage(self, usage: dict[str, Any]) -> None:
+        """Persist metadata only; prompts, excerpts, and credentials are never accepted."""
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO ai_usage (
+                    usage_id, repository_id, request_id, call_number, role, provider, model,
+                    input_tokens, output_tokens, total_tokens, usage_kind, cost, cost_kind, pricing_basis,
+                    duration_ms, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    usage["usage_id"], usage["repository_id"], usage["request_id"],
+                    usage["call_number"], usage["role"], usage["provider"], usage["model"],
+                    usage.get("input_tokens"), usage.get("output_tokens"), usage.get("total_tokens"),
+                    usage["usage_kind"], usage.get("cost"), usage.get("cost_kind", "unavailable"),
+                    usage.get("pricing_basis"),
+                    usage["duration_ms"], usage["status"], usage["created_at"],
+                ),
+            )
+
+    def get_ai_usage(self, repository_id: str, request_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT role, provider, model, input_tokens, output_tokens, total_tokens, "
+                "usage_kind, cost, cost_kind, pricing_basis, duration_ms, status, created_at "
+                "FROM ai_usage WHERE repository_id=? AND request_id=? ORDER BY call_number",
+                (repository_id, request_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def set_status(self, repository_id: str, status: str, error_message: str | None = None) -> None:
         with self._connect() as connection:

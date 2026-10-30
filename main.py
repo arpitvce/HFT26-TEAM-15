@@ -17,6 +17,7 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from ai_explanation import AIExplanationError, ExplanationService
 from repository_ingestion import IngestionError, ingest_zip_archive, register_local_repository
 from repository_scanner import (
     RepositoryScanError,
@@ -268,6 +269,77 @@ class SearchResponse(BaseModel):
     available_methods: list[Literal["lexical", "semantic", "symbol"]]
     effective_weights: dict[str, float]
     results: list[SearchResultResponse]
+
+
+class AskRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    question: str = Field(..., min_length=1, max_length=2000)
+    limit: int = Field(8, ge=1, le=20)
+    retrieval_method: Literal["hybrid", "lexical", "semantic", "symbol"] = "hybrid"
+    language: str | None = Field(None, min_length=1, max_length=50)
+    file_path: str | None = Field(None, min_length=1, max_length=4096)
+    path_prefix: str | None = Field(None, min_length=1, max_length=4096)
+    symbol_type: Literal["class", "function", "method"] | None = None
+
+    @model_validator(mode="after")
+    def validate_path_filter(self) -> AskRequest:
+        if self.file_path is not None and self.path_prefix is not None:
+            raise ValueError("file_path and path_prefix cannot be used together")
+        return self
+
+
+class AskEvidenceResponse(BaseModel):
+    evidence_id: str
+    file_path: str
+    symbol_name: str | None
+    symbol_type: Literal["class", "function", "method"] | None
+    language: str
+    snippet: str
+    start_line: int
+    end_line: int
+    snippet_truncated: bool
+    retrieval_methods: list[Literal["lexical", "semantic", "symbol"]]
+
+
+class AskClaimResponse(BaseModel):
+    claim_id: str
+    text: str
+    evidence_ids: list[str]
+    assessment_evidence_ids: list[str]
+    verification: Literal[
+        "model_assessed_supported", "model_assessed_contradicted",
+        "model_assessed_not_established", "model_assessed_ambiguous",
+    ]
+
+
+class AskUsageResponse(BaseModel):
+    role: Literal["answer_generator", "evidence_verifier"]
+    provider: str
+    model: str
+    input_tokens: int | None
+    output_tokens: int | None
+    total_tokens: int | None
+    usage_available: bool
+    cost: float | None
+    cost_kind: Literal["estimated", "unavailable"]
+    cost_available: bool
+    pricing_basis: str | None
+    status: Literal["succeeded", "failed"]
+
+
+class AskResponse(BaseModel):
+    repository_id: str
+    question: str
+    answer: str
+    insufficient_evidence: bool
+    claims: list[AskClaimResponse]
+    evidence: list[AskEvidenceResponse]
+    model: str | None
+    generator_model: str | None
+    verifier_model: str | None
+    request_id: str
+    usage: list[AskUsageResponse]
 
 
 def get_store() -> RepositoryStore:
@@ -554,6 +626,30 @@ def search_repository_endpoint(repository_id: str, request: SearchRequest) -> di
             normalized_path_prefix,
             request.symbol_type,
         )
+    except SearchUnavailableError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@app.post("/repositories/{repository_id}/ask", response_model=AskResponse)
+def ask_repository_endpoint(repository_id: str, request: AskRequest) -> dict[str, Any]:
+    store = get_store()
+    _repository_for_current_parse(repository_id, store)
+    normalized_file_path = _normalize_relative_path(request.file_path) if request.file_path else None
+    normalized_path_prefix = _normalize_relative_path(request.path_prefix) if request.path_prefix else None
+    try:
+        return ExplanationService().explain(
+            repository_id,
+            request.question,
+            request.limit,
+            store,
+            request.retrieval_method,
+            request.language,
+            normalized_file_path,
+            normalized_path_prefix,
+            request.symbol_type,
+        )
+    except AIExplanationError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     except SearchUnavailableError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
